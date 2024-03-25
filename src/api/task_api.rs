@@ -1,9 +1,18 @@
 use crate::{models::task_model::Task, repository::mongodb_repo::MongoRepo};
+use lettre::transport::smtp::authentication::{Credentials, Mechanism};
+use mongodb::options::Credential;
 use mongodb::results::InsertOneResult;
 use rocket::{http::Status, response::status::Custom, serde::json::Json, Request, State};
 use rocket::request::{FromRequest, Outcome};
 use mongodb::bson::{oid::ObjectId, Bson};
 // use rocket::
+use lettre::{Message, SmtpTransport, Transport, message::{Mailbox, SinglePart}};
+use tokio::task;
+// use tokio::task;
+use std::error::Error;
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 // use serde::{Serialize, Deserialize};
 use chrono::{DateTime, ParseError, Utc};
@@ -91,6 +100,32 @@ impl<'r> FromRequest<'r> for AuthorizedUser {
     }
 }
 
+fn send_email_notification(recipient:&str, task_name:&str)->Result<(), Box<dyn Error>>{
+    let email_message = format!("Your {} task is due now", task_name);
+    let sender_mailbox = Mailbox::new(None, "macshah13158@gmail.com".parse().unwrap());
+    let recipient_mailbox = Mailbox::new(None, recipient.parse().unwrap());
+    let email = Message::builder()
+        .from(sender_mailbox)
+        .to(recipient_mailbox)
+        .subject("Task Reminder")
+        .body(email_message)
+        .unwrap();
+
+    let credentials = Credentials::new("macshah13158@gmail.com".to_string(), "aclg tatp jazh ivtl".to_string());
+
+    let mailer = SmtpTransport::relay("smtp.gmail.com")
+        .unwrap()
+        .credentials(credentials)
+        .build();
+
+ let result = mailer.send(&email);
+    match result {
+        Ok(_) => Ok(()),
+        Err(e) => Err(Box::new(e)),
+    }
+
+}
+
 #[post("/addreminder", data = "<new_task>")]
 pub fn add_reminder(
     db: &State<MongoRepo>,
@@ -117,18 +152,23 @@ pub fn add_reminder(
 
     // Check if the date is valid
     if let Some(reminder_date) = new_task_data.reminder_date {
-        if reminder_date < Utc::now() {
+        if reminder_date <= Utc::now() {
             let json_response = json!({"error": "Reminder date must be in the future"});
             return Err(Custom(Status::BadRequest, json_response.into()));
         }
-        let parse_date = match parse_remider_date(&reminder_date.to_rfc3339()) {
-            Ok(parsed_date) => parsed_date,
-            Err(_) => {
-                let json_response = json!({"error":"Date formate is not valid"});
-                return Err(Custom(Status::BadRequest, json_response.into()));
-            }
-        };
-        println!("hello: {}", parse_date);
+
+        match send_email_notification(&new_task_data.user_email, &new_task_data.task) {
+            Ok(_) => println!("Email was send..."),
+            Err(err) => println!("There was an error while sending mail : {}",err)
+        }
+        // let parse_date = match parse_remider_date(&reminder_date.to_rfc3339()) {
+        //     Ok(parsed_date) => parsed_date,
+        //     Err(_) => {
+        //         let json_response = json!({"error":"Date formate is not valid"});
+        //         return Err(Custom(Status::BadRequest, json_response.into()));
+        //     }
+        // };
+        // println!("hello: {}", parse_date);
     }
 
     let task_data = Task {
@@ -136,7 +176,8 @@ pub fn add_reminder(
         task: new_task_data.task.to_owned(),
         description: new_task_data.description.to_owned(),
         reminder_date: new_task_data.reminder_date,
-        user_id:Some(user_id.expect("REASON"))
+        user_id:Some(user_id.expect("REASON")),
+        user_email:new_task_data.user_email.to_owned()
     };
     let task_detail = db.db_create_task(task_data);
     match task_detail {
@@ -150,15 +191,44 @@ pub fn add_reminder(
 
 #[get("/showreminder")]
 pub fn get_reminder(db: &State<MongoRepo>) -> Result<Json<Vec<Task>>, Custom<JsonValue>> {
-    let task_deatils = db.get_all_tasks();
-    match task_deatils {
-        Ok(task) => Ok(Json(task)),
-        Err(_) => {
-            let json_response = json!({ "error": "No tasks found" });
-            Err(Custom(Status::NotFound, json_response.into()))
+    let task_details = db.get_all_tasks();
+
+    let task_vec = match task_details {
+        Ok(tasks) => tasks,
+        Err(_) => return Err(Custom(Status::NotFound, json!({ "error": "No tasks found" }).into())),
+    };
+
+    // Iterate over tasks to schedule reminders
+    for task in &task_vec {
+        if let Some(reminder_date) = task.reminder_date {
+            let now = Utc::now();
+            if reminder_date <= now {
+                // Send reminder immediately or at scheduled time
+                if let Err(err) = send_email_notification(&task.user_email, &task.task) {
+                    println!("Failed to send reminder for task {}: {}", task.task, err);
+                } else {
+                    println!("Reminder sent for task {}", task.task);
+                }
+            } else {
+                // Calculate the duration to wait before sending the reminder
+                let duration_until_reminder = reminder_date.signed_duration_since(now).to_std().unwrap();
+                let task_clone = task.clone(); // Clone task for closure
+                thread::spawn(move || {
+                    thread::sleep(duration_until_reminder);
+                    if let Err(err) = send_email_notification(&task_clone.user_email, &task_clone.task) {
+                        println!("Failed to send reminder for task {}: {}", task_clone.task, err);
+                    } else {
+                        println!("Reminder sent for task {}", task_clone.task);
+                    }
+                });
+            }
         }
     }
+
+    // Return the Vec<Task> as JSON
+    Ok(Json(task_vec))
 }
+
 
 #[put("/updatereminder/<id>", data = "<new_task>")]
 pub fn update_reminder(
@@ -181,7 +251,8 @@ pub fn update_reminder(
         task: new_task.task.to_owned(),
         description: new_task.description.to_owned(),
         reminder_date: new_task.reminder_date,
-        user_id:Some(user_id.expect("REASON"))
+        user_id:Some(user_id.expect("REASON")),
+        user_email:new_task.user_email.to_owned()
     };
 
     let new_task_detail = db.update_task(&id, &new_task_data);

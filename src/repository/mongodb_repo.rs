@@ -74,7 +74,8 @@ impl MongoRepo{
             task:new_task.task,
             description:new_task.description,
             reminder_date:new_task.reminder_date,
-            user_id:new_task.user_id
+            user_id:new_task.user_id,
+            user_email:new_task.user_email
         };
         let task = self.task_col.insert_one(new_task_doc,None).ok().expect("failed to load task");
         Ok(task)
